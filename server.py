@@ -907,6 +907,48 @@ class Gateway:
 
 gw = Gateway()
 cfg_lock = asyncio.Lock()
+_gateway_restart_task: asyncio.Task | None = None
+_gateway_restart_result: dict[str, object] = {
+    "name": "gateway-restart",
+    "pid": None,
+    "exit_code": None,
+    "running": False,
+}
+
+
+async def _run_managed_gateway_restart() -> None:
+    """Restart the one gateway process owned by this Railway server."""
+    global _gateway_restart_result
+    try:
+        await gw.restart()
+        if gw.state != "running":
+            raise RuntimeError(f"gateway ended restart in state {gw.state}")
+        _gateway_restart_result["exit_code"] = 0
+        gw.logs.append("[gateway] managed restart completed")
+    except Exception as exc:
+        _gateway_restart_result["exit_code"] = 1
+        _gateway_restart_result["error"] = str(exc)
+        gw.logs.append(f"[gateway] managed restart failed: {exc}")
+    finally:
+        _gateway_restart_result["pid"] = (
+            gw.proc.pid if gw.proc and gw.proc.returncode is None else None
+        )
+        _gateway_restart_result["running"] = False
+
+
+def _schedule_managed_gateway_restart() -> bool:
+    """Start at most one restart task; return whether a new task was scheduled."""
+    global _gateway_restart_task, _gateway_restart_result
+    if _gateway_restart_task and not _gateway_restart_task.done():
+        return False
+    _gateway_restart_result = {
+        "name": "gateway-restart",
+        "pid": gw.proc.pid if gw.proc and gw.proc.returncode is None else None,
+        "exit_code": None,
+        "running": True,
+    }
+    _gateway_restart_task = asyncio.create_task(_run_managed_gateway_restart())
+    return True
 
 
 # ── Hermes dashboard subprocess ───────────────────────────────────────────────
@@ -1067,19 +1109,37 @@ async def api_logs(request: Request):
 async def api_gw_start(request: Request):
     if err := guard(request): return err
     asyncio.create_task(gw.start())
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "name": "gateway-start", "pid": None})
 
 
 async def api_gw_stop(request: Request):
     if err := guard(request): return err
     asyncio.create_task(gw.stop())
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "name": "gateway-stop", "pid": None})
 
 
 async def api_gw_restart(request: Request):
     if err := guard(request): return err
-    asyncio.create_task(gw.restart())
-    return JSONResponse({"ok": True})
+    _schedule_managed_gateway_restart()
+    pid = gw.proc.pid if gw.proc and gw.proc.returncode is None else None
+    return JSONResponse({"ok": True, "name": "gateway-restart", "pid": pid})
+
+
+async def api_gw_restart_status(request: Request):
+    if err := guard(request): return err
+    try:
+        requested_lines = int(request.query_params.get("lines", "200"))
+    except ValueError:
+        requested_lines = 200
+    line_limit = max(1, min(requested_lines, 500))
+    task_running = bool(_gateway_restart_task and not _gateway_restart_task.done())
+    status = {
+        **_gateway_restart_result,
+        "pid": gw.proc.pid if gw.proc and gw.proc.returncode is None else None,
+        "running": task_running,
+        "lines": list(gw.logs)[-line_limit:],
+    }
+    return JSONResponse(status)
 
 
 async def api_config_reset(request: Request):
@@ -1529,6 +1589,13 @@ routes = [
     Route("/setup/api/gateway/start",           api_gw_start,        methods=["POST"]),
     Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),
     Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
+    # The native Hermes dashboard also exposes these paths. Keep its lifecycle
+    # controls on the Railway-owned Gateway manager instead of proxying them to
+    # Hermes, which would spawn a second `hermes gateway` beside our supervisor.
+    Route("/api/gateway/start",                  api_gw_start,        methods=["POST"]),
+    Route("/api/gateway/stop",                   api_gw_stop,         methods=["POST"]),
+    Route("/api/gateway/restart",                api_gw_restart,      methods=["POST"]),
+    Route("/api/actions/gateway-restart/status", api_gw_restart_status, methods=["GET"]),
     Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
     Route("/setup/api/pairing/pending",         api_pairing_pending),
     Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
