@@ -48,5 +48,8 @@ fi
 # container), so removing the file unconditionally is safe.
 rm -f /data/.hermes/gateway.pid
 
-hermes gateway run &
+# server.py owns the gateway lifecycle: its startup hook starts one gateway
+# subprocess, and its supervisor restarts it if it exits unexpectedly. Starting
+# a second gateway here races that managed process and makes platform bots
+# (especially Discord Socket Mode) reject the duplicate connection.
 exec python /app/server.py
