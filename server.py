@@ -165,6 +165,19 @@ CHANNEL_MAP  = {
     "Matrix":      "MATRIX_ACCESS_TOKEN",
 }
 
+# RED's metal quote-verification channel. Keep this override deployment-managed
+# so the role survives container restarts while preserving other user config.
+METAL_CHANNEL_ID = "C0C9VPA9X19"
+METAL_CHANNEL_SYSTEM_PROMPT = """You are 차진재, the Metal Price Forensics Officer for RED Slack #금속-시세검증.
+
+This channel-specific role takes priority over the workspace-wide R-PM / 총괄 PM identity. Do not introduce yourself as R-PM or 총괄 PM here. If asked who you are, say: “차진재, 금속 시세·견적 검증 담당입니다.”
+
+Your job is to review non-ferrous metal prices and supplier quotes. Normalize each quote by metal/alloy and grade, composition or purity, product form, quantity, quote date, currency and unit, location and delivery terms, deductions, treatment/refining charges, and payment terms. Compare like with like; state each assumption and calculation.
+
+Use current market data only when a connected research tool provides it. Name the source and date. Separate exchange benchmarks from scrap or delivered-market quotes. Never invent prices, sources, assay results, MTC/COA contents, or inspection findings. Mark each important point as verified, unverified, or an assumption; call out missing evidence and discrepancies.
+
+Organize substantial answers as: conclusion; normalized quote; benchmark and evidence; risks or missing items; next action. Ask only for information that blocks a useful assessment. Give a provisional assessment when possible. You may prepare recommendations and analysis, but a human must approve any binding buy/sell decision, contract, payment, or shipment commitment. Follow all platform safety and tool instructions."""
+
 
 # ── .env helpers ──────────────────────────────────────────────────────────────
 def read_env(path: Path) -> dict[str, str]:
@@ -194,9 +207,9 @@ def write_config_yaml(data: dict[str, str]) -> None:
     restart and required hand-restoration after each redeploy.
 
     The fix: load the existing file if any, apply the deployment-managed keys
-    (``model.default``, ``model.provider``, ``terminal``, ``agent``, ``data_dir``)
-    on top, and write the merged result. Unknown top-level keys (``mcp_servers``,
-    custom skill config, etc.) are preserved verbatim.
+    (``model.default``, ``model.provider``, ``terminal``, ``agent``, ``data_dir``,
+    and RED's metal-channel persona) on top, and write the merged result. Unknown
+    top-level keys (``mcp_servers``, custom skill config, etc.) are preserved.
     """
     import yaml  # hermes-agent already pulls pyyaml; deferred import keeps cold start light
 
@@ -227,6 +240,24 @@ def write_config_yaml(data: dict[str, str]) -> None:
     if any(data.get(k) for k in PROVIDER_KEYS):
         merged_model["provider"] = "auto"
     merged["model"] = merged_model
+
+    merged_platforms = dict(merged.get("platforms") if isinstance(merged.get("platforms"), dict) else {})
+    merged_slack = dict(merged_platforms.get("slack") if isinstance(merged_platforms.get("slack"), dict) else {})
+    merged_channel_overrides = dict(
+        merged_slack.get("channel_overrides")
+        if isinstance(merged_slack.get("channel_overrides"), dict)
+        else {}
+    )
+    metal_override = dict(
+        merged_channel_overrides.get(METAL_CHANNEL_ID)
+        if isinstance(merged_channel_overrides.get(METAL_CHANNEL_ID), dict)
+        else {}
+    )
+    metal_override["system_prompt"] = METAL_CHANNEL_SYSTEM_PROMPT
+    merged_channel_overrides[METAL_CHANNEL_ID] = metal_override
+    merged_slack["channel_overrides"] = merged_channel_overrides
+    merged_platforms["slack"] = merged_slack
+    merged["platforms"] = merged_platforms
 
     merged_terminal = dict(merged.get("terminal") if isinstance(merged.get("terminal"), dict) else {})
     merged_terminal["backend"] = "local"
