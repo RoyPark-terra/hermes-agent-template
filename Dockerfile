@@ -68,6 +68,9 @@ RUN uv pip install --system --no-cache -r /app/requirements.txt
 RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py
+COPY slack_token_rotation.py /app/slack_token_rotation.py
+COPY slack_token_hot_reload.py /app/slack_token_hot_reload.py
+COPY sitecustomize.py /app/sitecustomize.py
 COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
