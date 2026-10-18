@@ -1016,8 +1016,12 @@
           <div class="toggle-body" x-show="channelsEnabled.slack">
             <div class="field-grid-2">
               <div><label class="field-label">Bot Token (xoxb-…)</label><input type="password" :value="vars.SLACK_BOT_TOKEN||''" @input="vars.SLACK_BOT_TOKEN=$event.target.value" placeholder="xoxb-..."></div>
-              <div><label class="field-label">App Token (xapp-…)</label><input type="password" :value="vars.SLACK_APP_TOKEN||''" @input="vars.SLACK_APP_TOKEN=$event.target.value" placeholder="xapp-..."></div>
+              <div><label class="field-label">App Token (xapp-… / xoxe.xapp-…)</label><input type="password" :value="vars.SLACK_APP_TOKEN||''" @input="vars.SLACK_APP_TOKEN=$event.target.value" placeholder="xapp-... or xoxe.xapp-..."></div>
+              <div><label class="field-label">App Refresh Token</label><input type="password" :value="vars.SLACK_APP_REFRESH_TOKEN||''" @input="vars.SLACK_APP_REFRESH_TOKEN=$event.target.value" placeholder="Shown once when the rotating token is created"></div>
+              <div><label class="field-label">App Client ID</label><input type="text" :value="vars.SLACK_APP_CLIENT_ID||''" @input="vars.SLACK_APP_CLIENT_ID=$event.target.value" placeholder="Slack app Basic Information"></div>
+              <div><label class="field-label">App Client Secret</label><input type="password" :value="vars.SLACK_APP_CLIENT_SECRET||''" @input="vars.SLACK_APP_CLIENT_SECRET=$event.target.value" placeholder="Slack app Basic Information"></div>
             </div>
+            <p class="hint">토큰 회전이 켜진 앱은 앱 토큰, 새로고침 토큰, Client ID, Client Secret을 한 번 저장하면 Hermes가 만료 전에 자동 갱신합니다.</p>
           </div>
 
           <!-- Email -->
@@ -1534,7 +1538,7 @@ function app() {
       const keysMap = {
         telegram:   ['TELEGRAM_BOT_TOKEN','TELEGRAM_ALLOWED_USERS'],
         discord:    ['DISCORD_BOT_TOKEN','DISCORD_ALLOWED_USERS'],
-        slack:      ['SLACK_BOT_TOKEN','SLACK_APP_TOKEN'],
+        slack:      ['SLACK_BOT_TOKEN','SLACK_APP_TOKEN','SLACK_APP_REFRESH_TOKEN','SLACK_APP_CLIENT_ID','SLACK_APP_CLIENT_SECRET'],
         email:      ['EMAIL_ADDRESS','EMAIL_PASSWORD','EMAIL_IMAP_HOST','EMAIL_SMTP_HOST'],
         mattermost: ['MATTERMOST_URL','MATTERMOST_TOKEN'],
         matrix:     ['MATRIX_HOMESERVER','MATRIX_ACCESS_TOKEN','MATRIX_USER_ID'],

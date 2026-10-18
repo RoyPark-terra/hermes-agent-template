@@ -53,6 +53,7 @@ from starlette.responses import (
 from starlette.routing import Route, WebSocketRoute
 from starlette.templating import Jinja2Templates
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
+from slack_token_rotation import refresh_slack_app_token
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -138,6 +139,9 @@ ENV_VARS = [
     ("DISCORD_ALLOWED_USERS",    "Allowed User IDs",         "discord",   False),
     ("SLACK_BOT_TOKEN",          "Bot Token (xoxb-...)",     "slack",     True),
     ("SLACK_APP_TOKEN",          "App Token (xapp-...)",     "slack",     True),
+    ("SLACK_APP_REFRESH_TOKEN",  "App Token Refresh Token", "slack",     True),
+    ("SLACK_APP_CLIENT_ID",      "App Client ID",           "slack",     False),
+    ("SLACK_APP_CLIENT_SECRET",  "App Client Secret",       "slack",     True),
     ("WHATSAPP_ENABLED",         "Enable WhatsApp",          "whatsapp",  False),
     ("EMAIL_ADDRESS",            "Email Address",            "email",     False),
     ("EMAIL_PASSWORD",           "Email Password",           "email",     True),
@@ -194,6 +198,13 @@ def read_env(path: Path) -> dict[str, str]:
             v = v[1:-1]
         out[k.strip()] = v
     return out
+
+
+def effective_env() -> dict[str, str]:
+    """Runtime configuration with the dashboard's persistent .env taking priority."""
+    values = dict(os.environ)
+    values.update(read_env(ENV_FILE))
+    return values
 
 
 def write_config_yaml(data: dict[str, str]) -> None:
@@ -327,6 +338,90 @@ def write_env(path: Path, data: dict[str, str]) -> None:
         lines.append("")
 
     path.write_text("\n".join(lines))
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+SLACK_TOKEN_REFRESH_BUFFER_S = 60 * 60  # refresh one hour before Slack's 12-hour expiry
+SLACK_TOKEN_RETRY_S = 60
+SLACK_TOKEN_CONFIG_POLL_S = 60
+
+
+async def _refresh_slack_app_token_from_env() -> int | None:
+    """Rotate a Slack xoxe.xapp token and persist its one-time refresh token."""
+    async with cfg_lock:
+        data = read_env(ENV_FILE)
+        runtime = dict(os.environ)
+        runtime.update(data)
+        app_token = runtime.get("SLACK_APP_TOKEN", "").strip()
+        if not app_token.startswith("xoxe.xapp-"):
+            return None
+        client_id = runtime.get("SLACK_APP_CLIENT_ID", "").strip()
+        client_secret = runtime.get("SLACK_APP_CLIENT_SECRET", "").strip()
+        refresh_token = runtime.get("SLACK_APP_REFRESH_TOKEN", "").strip()
+        if not (client_id and client_secret and refresh_token):
+            raise RuntimeError("Slack token rotation needs the app client ID, client secret, and refresh token")
+
+        result = await refresh_slack_app_token(
+            client_id=client_id,
+            client_secret=client_secret,
+            refresh_token=refresh_token,
+        )
+        data["SLACK_APP_TOKEN"] = result.access_token
+        data["SLACK_APP_REFRESH_TOKEN"] = result.refresh_token
+        write_env(ENV_FILE, data)
+        return result.expires_in
+
+
+async def _slack_token_rotation_loop(initial_delay: int | None = None) -> None:
+    """Keep rotating Slack credentials without restarting the shared gateway."""
+    loop = asyncio.get_running_loop()
+    next_refresh = loop.time() + (initial_delay if initial_delay is not None else 0)
+    last_token = effective_env().get("SLACK_APP_TOKEN", "").strip()
+    warned_signature: tuple[bool, bool, bool] | None = None
+
+    while True:
+        data = effective_env()
+        app_token = data.get("SLACK_APP_TOKEN", "").strip()
+        if not app_token.startswith("xoxe.xapp-"):
+            last_token = app_token
+            next_refresh = loop.time() + SLACK_TOKEN_CONFIG_POLL_S
+            await asyncio.sleep(SLACK_TOKEN_CONFIG_POLL_S)
+            continue
+
+        credential_keys = ("SLACK_APP_CLIENT_ID", "SLACK_APP_CLIENT_SECRET", "SLACK_APP_REFRESH_TOKEN")
+        complete = all(data.get(key, "").strip() for key in credential_keys)
+        if not complete:
+            signature = tuple(bool(data.get(key, "").strip()) for key in credential_keys)
+            if signature != warned_signature:
+                gw.logs.append("[Slack] Rotating app token needs client ID, client secret, and refresh token")
+                warned_signature = signature
+            await asyncio.sleep(SLACK_TOKEN_CONFIG_POLL_S)
+            continue
+
+        if app_token != last_token:
+            next_refresh = loop.time()
+        delay = next_refresh - loop.time()
+        if delay > 0:
+            await asyncio.sleep(min(delay, SLACK_TOKEN_CONFIG_POLL_S))
+            continue
+
+        try:
+            expires_in = await _refresh_slack_app_token_from_env()
+            if expires_in is None:
+                await asyncio.sleep(SLACK_TOKEN_CONFIG_POLL_S)
+                continue
+            last_token = effective_env().get("SLACK_APP_TOKEN", "").strip()
+            warned_signature = None
+            next_refresh = loop.time() + max(60, expires_in - SLACK_TOKEN_REFRESH_BUFFER_S)
+            gw.logs.append("[Slack] App token refreshed; the Slack Socket Mode client will use it on reconnect")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            gw.logs.append(f"[Slack] Token refresh failed ({type(exc).__name__}); retrying shortly")
+            next_refresh = loop.time() + SLACK_TOKEN_RETRY_S
 
 
 # ── xAI Grok SuperGrok OAuth (Device Code — RFC 8628) ───────────────────────
@@ -819,6 +914,12 @@ class Gateway:
             # (which reads the same file) doesn't shadow our values.
             env = {**os.environ, "HERMES_HOME": HERMES_HOME}
             env.update(read_env(ENV_FILE))
+            # Follow the persistent Slack token file inside Hermes so reconnects
+            # use the latest credential without restarting Telegram or Discord.
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join(p for p in ("/app", existing_pythonpath) if p)
+            env["HERMES_SLACK_TOKEN_HOT_RELOAD"] = "1"
+            env["HERMES_SLACK_TOKEN_FILE"] = str(ENV_FILE)
             model = env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
@@ -1433,6 +1534,19 @@ async def auto_start():
 
 @asynccontextmanager
 async def lifespan(app):
+    # If Slack token rotation is enabled, refresh before the gateway starts.
+    initial_rotation_delay = None
+    try:
+        expires_in = await _refresh_slack_app_token_from_env()
+        if expires_in is not None:
+            initial_rotation_delay = max(60, expires_in - SLACK_TOKEN_REFRESH_BUFFER_S)
+            print("[Slack] Rotating app token initialized; automatic renewal is active", flush=True)
+    except Exception as exc:
+        # Keep Telegram and Discord available if Slack credentials need attention.
+        initial_rotation_delay = SLACK_TOKEN_RETRY_S
+        print(f"[Slack] Initial token refresh failed ({type(exc).__name__}); retrying in 60s", flush=True)
+
+    slack_rotation_task = asyncio.create_task(_slack_token_rotation_loop(initial_rotation_delay))
     # Dashboard runs always — it's the user-facing UI after setup is done,
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
@@ -1440,9 +1554,11 @@ async def lifespan(app):
     try:
         yield
     finally:
+        slack_rotation_task.cancel()
         await asyncio.gather(
             gw.stop(),
             dash.stop(),
+            slack_rotation_task,
             return_exceptions=True,
         )
         global _http_client
